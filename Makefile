@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: run doctor dry-run teardown build test fmt verify screenshots
+.PHONY: run doctor dry-run teardown build test fmt verify screenshots generate
 
 # Launch the interactive installer.
 run:
@@ -49,6 +49,15 @@ fmt:
 
 verify:
 	for m in $(MODULES); do (cd $$m && test -z "$$(gofmt -l .)" && go vet ./...) || exit 1; done
+	cd installer && go run ./cmd/tfgen -check ..
+
+# Regenerate the Terraform module from the wizard's input declarations
+# (installer/internal/inputs) with installer/internal/tfgen. Run it after
+# changing a screen's fields or their validation, and commit the result;
+# `make verify` and the tfgen tests fail while it is stale. See
+# terraform/modules/substrate-gke/README.md.
+generate:
+	cd installer && go generate ./internal/tfgen
 
 # Regenerate the README screenshots from the dry-run wizard. Needs freeze:
 # go install github.com/charmbracelet/freeze@latest

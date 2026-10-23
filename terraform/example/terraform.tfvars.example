@@ -1,0 +1,7 @@
+project_id = "my-project"
+
+# The actor sandbox runtime; "gvisor" is the module's (and the wizard's)
+# default; "microvm" runs actors in kata + cloud-hypervisor micro-VMs on 
+# the node pool's nested virtualization, another very popular choice.
+# sandbox_class = "microvm"
+sandbox_class = "gvisor"

@@ -1,0 +1,209 @@
+# The GCP resources setup-gcp's bootstrap creates for the wizard
+# (tools/setup-gcp/cmd/bootstrap.go), as Terraform resources. Differences, on
+# purpose: APIs are enabled by the caller (see terraform/example), and the
+# managed OpenTelemetry config and the monitoring dashboards are left out.
+
+data "google_project" "this" {
+  project_id = var.project_id
+}
+
+locals {
+  project_number = data.google_project.this.number
+  workload_pool  = "${var.project_id}.svc.id.goog"
+
+  # Workload Identity principal for a Kubernetes service account in
+  # ate-system.
+  ate_system_principal = "principal://iam.googleapis.com/projects/${local.project_number}/locations/global/workloadIdentityPools/${local.workload_pool}/subject/ns/ate-system/sa"
+
+  # The node pool runs as the Compute Engine default service account.
+  node_service_account = "${local.project_number}-compute@developer.gserviceaccount.com"
+
+  # setup-gcp's requiredBetaAPIs and requiredNodeSysctls
+  # (tools/setup-gcp/cmd/cluster.go), from inputs.GCP.
+  required_beta_apis = {{ list .BetaAPIs }}
+  node_sysctls = {{ map .NodeSysctls }}
+
+  # setup-gcp creates its pool with this many nodes; with autoscaling the
+  # count starts there, inside the bounds.
+  initial_nodes = {{ .InitialNodes }}
+}
+
+# ─── Artifact Registry (source builds without a registry of their own) ─────
+
+resource "google_artifact_registry_repository" "images" {
+  count = local.creates_artifact_repository ? 1 : 0
+
+  project       = var.project_id
+  location      = local.region
+  repository_id = local.repository_name
+  format        = "DOCKER"
+  description   = "Substrate images built from source"
+}
+
+# ─── GKE cluster ───────────────────────────────────────────────────────────
+
+resource "google_container_cluster" "this" {
+  count = var.create_cluster ? 1 : 0
+
+  project  = var.project_id
+  name     = var.cluster_name
+  location = var.cluster_location
+
+  min_master_version = local.cluster_version
+  release_channel {
+    channel = upper(local.release_channel)
+  }
+
+  network           = var.network
+  subnetwork        = var.subnetwork
+  datapath_provider = "ADVANCED_DATAPATH" # Dataplane V2, as upstream defaults it
+
+  # The Substrate pool is managed below, where autoscaling can be set.
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  enable_k8s_beta_apis {
+    enabled_apis = local.required_beta_apis
+  }
+  workload_identity_config {
+    workload_pool = local.workload_pool
+  }
+  addons_config {
+    # The Substrate overlay of the Filestore driver replaces GKE's own.
+    gcp_filestore_csi_driver_config {
+      enabled = false
+    }
+  }
+
+  deletion_protection = var.deletion_protection
+}
+
+resource "google_container_node_pool" "substrate" {
+  count = var.create_cluster ? 1 : 0
+
+  project  = var.project_id
+  name     = var.node_pool
+  cluster  = google_container_cluster.this[0].name
+  location = var.cluster_location
+
+  node_count         = var.autoscaling_enabled ? null : local.initial_nodes
+  initial_node_count = var.autoscaling_enabled ? min(max(local.initial_nodes, var.autoscaling_min_nodes), var.autoscaling_max_nodes) : null
+
+  dynamic "autoscaling" {
+    for_each = var.autoscaling_enabled ? [1] : []
+    content {
+      min_node_count = var.autoscaling_min_nodes
+      max_node_count = var.autoscaling_max_nodes
+    }
+  }
+
+  node_config {
+    machine_type = var.machine_type
+    oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+    # /dev/kvm for micro-VM workers. On for every sandbox class, as in
+    # setup-gcp, so switching to micro-VM later needs no new pool.
+    advanced_machine_features {
+      threads_per_core             = 0 # the machine type's default
+      enable_nested_virtualization = true
+    }
+    linux_node_config {
+      sysctls = local.node_sysctls
+    }
+    # The atelet DaemonSet and the demo WorkerPools select nodes by it. A
+    # build from source is versioned by its commit, which ate-setup knows and
+    # labels the nodes with itself.
+    labels = local.prebuilt ? { "ate.dev/substrate-version" = split("@", var.image_tag)[0] } : {}
+  }
+
+  lifecycle {
+    # The autoscaler owns the count once it runs.
+    ignore_changes = [initial_node_count]
+  }
+}
+
+# An existing cluster is used as it is, so it has to be ready already: the
+# wizard's bootstrap would update it, but Terraform does not manage it.
+data "google_container_cluster" "existing" {
+  count = var.create_cluster ? 0 : 1
+
+  project  = var.project_id
+  name     = var.cluster_name
+  location = var.cluster_location
+
+  lifecycle {
+    postcondition {
+      condition     = try(self.workload_identity_config[0].workload_pool, "") == local.workload_pool
+      error_message = "Cluster ${var.cluster_name} does not have Workload Identity on. Run: gcloud container clusters update ${var.cluster_name} --location ${var.cluster_location} --project ${var.project_id} --workload-pool=${local.workload_pool}"
+    }
+    postcondition {
+      condition     = length(setsubtract(local.required_beta_apis, try(self.enable_k8s_beta_apis[0].enabled_apis, []))) == 0
+      error_message = "Cluster ${var.cluster_name} does not serve the PodCertificate beta APIs. Run: gcloud container clusters update ${var.cluster_name} --location ${var.cluster_location} --project ${var.project_id} --enable-kubernetes-unstable-apis=${join(",", local.required_beta_apis)}"
+    }
+  }
+}
+
+locals {
+  # Set once the cluster can take workloads: its pool exists, or it was
+  # already there.
+  cluster_id = var.create_cluster ? google_container_node_pool.substrate[0].id : data.google_container_cluster.existing[0].id
+}
+
+# ─── Snapshot bucket ───────────────────────────────────────────────────────
+
+resource "google_storage_bucket" "snapshots" {
+  project  = var.project_id
+  name     = local.bucket_name
+  location = upper(local.region)
+
+  # Workload Identity Federation is refused on buckets with legacy ACLs.
+  uniform_bucket_level_access = true
+  force_destroy               = var.bucket_force_destroy
+}
+
+# ─── IAM ───────────────────────────────────────────────────────────────────
+
+# Nodes pull images and read the bucket.
+resource "google_project_iam_member" "node" {
+  for_each = toset({{ list .NodeRoles }})
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${local.node_service_account}"
+}
+
+# atelet stages snapshots and pulls images. The Workload Identity pool exists
+# only once a cluster with Workload Identity does, hence the dependency.
+resource "google_project_iam_member" "atelet" {
+  for_each = toset({{ list .AteletRoles }})
+
+  project = var.project_id
+  role    = each.value
+  member  = "${local.ate_system_principal}/atelet"
+
+  depends_on = [google_container_cluster.this, data.google_container_cluster.existing]
+}
+
+# atelet writes and reads snapshots; ate-api-server copies them for tags and
+# deletes the ones nothing refers to.
+resource "google_storage_bucket_iam_member" "snapshots" {
+  for_each = {
+    for pair in setproduct({{ list .BucketSubjects }}, {{ list .BucketRoles }}) :
+    "${pair[0]} ${pair[1]}" => { subject = pair[0], role = pair[1] }
+  }
+
+  bucket = google_storage_bucket.snapshots.name
+  role   = each.value.role
+  member = "${local.ate_system_principal}/${each.value.subject}"
+
+  depends_on = [google_container_cluster.this, data.google_container_cluster.existing]
+}
+
+locals {
+  # What the helm provider connects with, from whichever cluster is used.
+  cluster_endpoint       = var.create_cluster ? google_container_cluster.this[0].endpoint : data.google_container_cluster.existing[0].endpoint
+  cluster_ca_certificate = var.create_cluster ? google_container_cluster.this[0].master_auth[0].cluster_ca_certificate : data.google_container_cluster.existing[0].master_auth[0].cluster_ca_certificate
+}

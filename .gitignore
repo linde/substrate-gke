@@ -2,3 +2,11 @@ bin/
 *.swp
 .DS_Store
 /tools/setup-gcp/setup-gcp
+
+# Terraform working state
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+terraform.tfvars
+.substrate/
