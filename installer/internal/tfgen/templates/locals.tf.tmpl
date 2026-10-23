@@ -1,0 +1,35 @@
+# Values the wizard derives from the inputs rather than asks for. Each mirrors
+# a Go function named beside it, and TestTerraformDerivations in
+# installer/internal/inputs holds the two to the same answers.
+
+locals {
+  prebuilt = var.image_source == "prebuilt"
+
+  # state.Setup.Region: a zonal location like us-west1-c maps to us-west1; a
+  # regional one is used as is. (HCL's && does not short-circuit, hence try.)
+  location_parts = split("-", var.cluster_location)
+  region = (
+    length(local.location_parts) == 3 && try(length(local.location_parts[2]), 0) == 1
+    ? join("-", slice(local.location_parts, 0, 2))
+    : var.cluster_location
+  )
+
+  # state.defaultBucketName: ate-snapshots-<project>-<cluster>-<location>,
+  # past 63 characters truncated and suffixed with a hash of the full name.
+  bucket_derived = lower("ate-snapshots-${var.project_id}-${var.cluster_name}-${var.cluster_location}")
+  bucket_name = (
+    var.bucket_name != "" ? var.bucket_name :
+    length(local.bucket_derived) <= 63 ? local.bucket_derived :
+    "${replace(substr(local.bucket_derived, 0, 54), "/[-_]+$/", "")}-${substr(sha256(local.bucket_derived), 0, 8)}"
+  )
+
+  # state.Setup.RepositoryName and BuildRepository.
+  repository_name  = var.artifact_registry_repository != "" ? var.artifact_registry_repository : "ate-images"
+  build_repository = var.ko_docker_repo != "" ? var.ko_docker_repo : "${local.region}-docker.pkg.dev/${var.project_id}/${local.repository_name}"
+  # state.Setup.CreatesArtifactRepository.
+  creates_artifact_repository = !local.prebuilt && var.ko_docker_repo == ""
+
+  # The new-cluster fields: cleared, each means its default.
+  cluster_version = var.cluster_version != "" ? var.cluster_version : local.defaults.cluster_version
+  release_channel = lower(var.release_channel != "" ? var.release_channel : local.defaults.release_channel)
+}
